@@ -1,64 +1,61 @@
+#include "range/v3/algorithm/for_each.hpp"
+#include "range/v3/view/concat.hpp"
 #include "range/v3/view/iota.hpp"
+#include "range/v3/view/repeat.hpp"
+#include "range/v3/view/zip.hpp"
 #include <atomic>
-#include <chrono>
+#include <condition_variable>
 #include <functional>
 #include <iostream>
 #include <mutex>
-#include <random>
 #include <thread>
 #include <vector>
 
 
 namespace {
 
-std::random_device rd;
-std::mt19937       g(rd());
+constexpr auto cutoff      = 1'000'000;
+constexpr auto threadCount = 4;
 }// namespace
 
 int main() {
-  enum State : std::uint8_t {
-    Wait,
-    Do,
-    Stop
-  };
-
-  std::atomic<State> state = Wait;
-  std::mutex         mutex;
-  int                global_i{};
+  bool                     ready = false;
+  std::atomic<std::size_t> threadsExitCount{};
+  std::mutex               mutex;
+  std::condition_variable  cv;
+  int                      global_i{};
+  const auto               awakeCondition = [&] { return threadsExitCount == threadCount; };
 
   std::vector<std::thread> executors;
   {
-    const auto handler = [&](auto&& f) {
-      while (state != Stop) {
-        switch (state) {
-          case Do:
-            std::invoke(std::forward<decltype(f)>(f));
-        }
+    const auto handler = [&](auto&& val) {
+      {
+        std::unique_lock ul{mutex};
+        cv.wait(ul, [&] { return ready; });
+      }
+      for (std::remove_cvref_t<decltype(cutoff)> i{}; i < cutoff; ++i) {
+        global_i += std::forward<decltype(val)>(val);
+      }
+      ++threadsExitCount;
+      if (awakeCondition()) {
+        cv.notify_all();
       }
     };
     using namespace ranges;
-    for ([[maybe_unused]] auto i : views::iota(0, 200)) {
-      executors.emplace_back(std::bind_front(handler, [&] {
-        std::lock_guard const _{mutex};
-        ++global_i;
-      }));
-      executors.emplace_back(std::bind_front(handler, [&] {
-        std::lock_guard const _{mutex};
-        --global_i;
-      }));
+    for (const auto [i, val] : views::concat(
+           views::zip(views::iota(0, threadCount / 2), views::repeat(1)),
+           views::zip(views::iota(0, threadCount / 2), views::repeat(-1)))) {
+      executors.emplace_back(std::bind_front(handler, val));
     }
   }
+  ready = true;
+  cv.notify_all();
 
-  std::shuffle(executors.begin(), executors.end(), g);
-
-  state = Do;
-  std::this_thread::sleep_for(std::chrono::seconds{1});
-
-  state = Stop;
-
-  for (auto& thread : executors) {
-    thread.join();
+  {
+    std::unique_lock ul{mutex};
+    cv.wait(ul, awakeCondition);
   }
+  ranges::for_each(executors, std::mem_fn(&std::thread::join));
 
   std::cout << global_i;
 
